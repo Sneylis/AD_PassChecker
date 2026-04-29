@@ -141,16 +141,44 @@ Before we start, I will check that the host is hardened.
               </StackPanel>
 
               <StackPanel x:Name="Page2" Visibility="Collapsed">
-                <TextBlock Text="Step 3 of 8 - Service account (Backup Operator)" FontSize="16" Foreground="#89B4FA" Margin="0,0,0,10"/>
+                <TextBlock Text="Step 3 of 8 - Service account" FontSize="16" Foreground="#89B4FA" Margin="0,0,0,10"/>
                 <TextBlock TextWrapping="Wrap" Foreground="#A6ADC8" Margin="0,0,0,10">
-This account will run Phase 1 (ntdsutil ifm) on the DC. Backup Operators membership is sufficient.
-The password is stored in a local SecretStore (DPAPI per-machine, protected by BitLocker FDE).
+The service account runs Phase 1 (ntdsutil ifm) on the DC and the Orchestrator on this station.
+Pick one of two modes:
                 </TextBlock>
-                <Label Content="Username (DOMAIN\sam or sam@domain)"/>
-                <TextBox x:Name="TbSvcUser" Text="CORP\svc-adaudit"/>
-                <Label Content="Password"/>
-                <PasswordBox x:Name="PbSvcPass"/>
-                <Button x:Name="BtnVerifyCred" Content="Verify credential (LDAP bind)" HorizontalAlignment="Left" Margin="0,10,0,0"/>
+
+                <RadioButton x:Name="RbGmsa"    Content="gMSA (recommended per regulation - no password)" IsChecked="True" Foreground="#CDD6F4"/>
+                <RadioButton x:Name="RbSvcUser" Content="Regular service account (username + password)"   Foreground="#CDD6F4"/>
+
+                <StackPanel x:Name="GmsaPanel" Margin="20,8,0,0">
+                  <TextBlock TextWrapping="Wrap" Foreground="#A6ADC8" Margin="0,0,0,6"
+                             FontFamily="Consolas" FontSize="11">
+Pre-requisite (one-time on the DC, under Domain Admin):
+  Add-KdsRootKey -EffectiveTime ((Get-Date).AddHours(-10))
+  New-ADServiceAccount -Name gmsa-adaudit -DNSHostName gmsa-adaudit.&lt;domain&gt; `
+       -PrincipalsAllowedToRetrieveManagedPassword 'DC$','&lt;station&gt;$'
+  Add-ADGroupMember -Identity 'Backup Operators' -Members gmsa-adaudit$
+On both DC and station:
+  Install-ADServiceAccount gmsa-adaudit
+  Test-ADServiceAccount gmsa-adaudit
+                  </TextBlock>
+                  <Label Content="gMSA name (with trailing $, e.g. CORP\gmsa-adaudit$)"/>
+                  <TextBox x:Name="TbGmsaName" Text="CORP\gmsa-adaudit$"/>
+                  <Button x:Name="BtnTestGmsa" Content="Test-ADServiceAccount" HorizontalAlignment="Left" Margin="0,6,0,0"/>
+                </StackPanel>
+
+                <StackPanel x:Name="SvcUserPanel" Margin="20,8,0,0" IsEnabled="False">
+                  <TextBlock TextWrapping="Wrap" Foreground="#A6ADC8" Margin="0,0,0,6">
+A regular AD account with Backup Operators membership. The password is stored in the local
+SecretStore (DPAPI per-machine, protected by BitLocker FDE). Less secure than gMSA.
+                  </TextBlock>
+                  <Label Content="Username (DOMAIN\sam or sam@domain)"/>
+                  <TextBox x:Name="TbSvcUser" Text="CORP\svc-adaudit"/>
+                  <Label Content="Password"/>
+                  <PasswordBox x:Name="PbSvcPass"/>
+                  <Button x:Name="BtnVerifyCred" Content="Verify credential (LDAP bind)" HorizontalAlignment="Left" Margin="0,6,0,0"/>
+                </StackPanel>
+
                 <TextBlock x:Name="CredTestResult" Margin="0,8,0,0" TextWrapping="Wrap"/>
               </StackPanel>
 
@@ -536,6 +564,8 @@ function Get-WizardModel {
         ScheduleDay                = [int]$ctl.TbDay.Text
         ScheduleHourDC             = [int]$ctl.TbHourDC.Text
         ScheduleHourStation        = [int]$ctl.TbHourStation.Text
+        UseGmsa                    = [bool]$ctl.RbGmsa.IsChecked
+        GmsaName                   = $ctl.TbGmsaName.Text.Trim()
         SvcUser                    = $ctl.TbSvcUser.Text.Trim()
     }
 }
@@ -551,6 +581,11 @@ function Update-Review {
         [void]$sb.AppendFormat('  {0,-30} = {1}', $k, $m[$k]).AppendLine()
     }
     [void]$sb.AppendFormat('  {0,-30} = {1}', 'SmtpRecipients', ($m.SmtpRecipients -join ', ')).AppendLine()
+    if ($m.UseGmsa) {
+        [void]$sb.AppendFormat('  {0,-30} = {1}', 'ServiceAccount', "$($m.GmsaName)  (gMSA mode)").AppendLine()
+    } else {
+        [void]$sb.AppendFormat('  {0,-30} = {1}', 'ServiceAccount', "$($m.SvcUser)  (regular account mode)").AppendLine()
+    }
     [void]$sb.AppendLine()
     [void]$sb.AppendLine('=== Will be done: ===')
     [void]$sb.AppendLine('  - install 7-Zip, SDelete64, RSAT-AD-PowerShell')
@@ -713,12 +748,27 @@ $script:InstallJob = {
         Clear-SensitiveVariable -SecureString $aesKey
 
         # 5. Service credential
-        Step 38 'Save service account credential into vault...'
-        $svcSecure = ConvertTo-SecureString $JobArgs.SvcPasswordPlain -AsPlainText -Force
-        Set-Secret -Name 'BackupOpCredential' -Vault 'ADAuditVault' -SecureStringSecret $svcSecure
-        $JobArgs.SvcPasswordPlain = $null
-        $svcSecure = $null
-        [GC]::Collect()
+        if ($JobArgs.Cfg.UseGmsa) {
+            Step 38 ('gMSA mode: validating ' + $JobArgs.Cfg.GmsaName + ' (Test-ADServiceAccount)...')
+            $gmsaShort = ($JobArgs.Cfg.GmsaName -split '\\')[-1].TrimEnd('$')
+            try {
+                Import-Module ActiveDirectory -ErrorAction Stop
+                if (Test-ADServiceAccount -Identity $gmsaShort) {
+                    Log "gMSA OK: this host can retrieve the managed password."
+                } else {
+                    Log "Test-ADServiceAccount returned False. Make sure this host is in PrincipalsAllowedToRetrieveManagedPassword and Install-ADServiceAccount was run." 'WARN'
+                }
+            } catch {
+                Log ("Test-ADServiceAccount failed: " + $_.Exception.Message + ". Continuing anyway - DC side may not have this gMSA yet.") 'WARN'
+            }
+        } else {
+            Step 38 'Regular service account: saving credential into vault...'
+            $svcSecure = ConvertTo-SecureString $JobArgs.SvcPasswordPlain -AsPlainText -Force
+            Set-Secret -Name 'BackupOpCredential' -Vault 'ADAuditVault' -SecureStringSecret $svcSecure
+            $JobArgs.SvcPasswordPlain = $null
+            $svcSecure = $null
+            [GC]::Collect()
+        }
 
         # 6. HIBP
         if ($JobArgs.Cfg.HibpDownload) {
@@ -804,35 +854,63 @@ $script:InstallJob = {
 </Task>
 "@
 
-        $svcUserForTask = $JobArgs.Cfg.SvcUser
-        $svcSecurePwd   = Get-Secret -Name BackupOpCredential -Vault ADAuditVault -AsPlainText:$false
-        $svcPlainPwd    = [System.Net.NetworkCredential]::new('', $svcSecurePwd).Password
+        if ($JobArgs.Cfg.UseGmsa) {
+            # gMSA path: no password; LogonType=Password tells the
+            # scheduler to fetch the managed password from AD.
+            $gmsaUser  = $JobArgs.Cfg.GmsaName
+            $principal = New-ScheduledTaskPrincipal -UserId $gmsaUser -LogonType Password -RunLevel Highest
 
-        Register-ScheduledTask -TaskName 'ADPasswordAudit-Orchestrator' `
-            -Action $orchAction -RunLevel Highest `
-            -User $svcUserForTask -Password $svcPlainPwd -Force | Out-Null
+            Register-ScheduledTask -TaskName 'ADPasswordAudit-Orchestrator' `
+                -Action $orchAction -Principal $principal -Force | Out-Null
 
-        $taskXml  = [xml](Export-ScheduledTask -TaskName 'ADPasswordAudit-Orchestrator')
-        $newTrig  = [xml]$orchTrigger
-        $importNs = $taskXml.Task.OwnerDocument.ImportNode($newTrig.Task.Triggers, $true)
-        $oldTrig  = $taskXml.Task.SelectSingleNode("*[local-name()='Triggers']")
-        if ($oldTrig) { $taskXml.Task.RemoveChild($oldTrig) | Out-Null }
-        $taskXml.Task.PrependChild($importNs) | Out-Null
+            $taskXml  = [xml](Export-ScheduledTask -TaskName 'ADPasswordAudit-Orchestrator')
+            $newTrig  = [xml]$orchTrigger
+            $importNs = $taskXml.Task.OwnerDocument.ImportNode($newTrig.Task.Triggers, $true)
+            $oldTrig  = $taskXml.Task.SelectSingleNode("*[local-name()='Triggers']")
+            if ($oldTrig) { $taskXml.Task.RemoveChild($oldTrig) | Out-Null }
+            $taskXml.Task.PrependChild($importNs) | Out-Null
 
-        Register-ScheduledTask -Xml $taskXml.OuterXml `
-            -TaskName 'ADPasswordAudit-Orchestrator' `
-            -User $svcUserForTask -Password $svcPlainPwd -Force | Out-Null
-        Log '  + ADPasswordAudit-Orchestrator (monthly, runs as service account)'
+            Register-ScheduledTask -Xml $taskXml.OuterXml `
+                -TaskName 'ADPasswordAudit-Orchestrator' `
+                -User $gmsaUser -LogonType Password -Force | Out-Null
+            Log "  + ADPasswordAudit-Orchestrator (monthly, runs as gMSA $gmsaUser)"
 
-        $retTrigger = New-ScheduledTaskTrigger -Daily -At '03:30am'
-        Register-ScheduledTask -TaskName 'ADPasswordAudit-Retention' `
-            -Action $retentAction -Trigger $retTrigger -RunLevel Highest `
-            -User $svcUserForTask -Password $svcPlainPwd -Force | Out-Null
-        Log '  + ADPasswordAudit-Retention (daily 03:30, runs as service account)'
+            $retTrigger = New-ScheduledTaskTrigger -Daily -At '03:30am'
+            Register-ScheduledTask -TaskName 'ADPasswordAudit-Retention' `
+                -Action $retentAction -Trigger $retTrigger -Principal $principal -Force | Out-Null
+            Log "  + ADPasswordAudit-Retention (daily 03:30, runs as gMSA $gmsaUser)"
+        } else {
+            # Regular service account path: pass plain password.
+            $svcUserForTask = $JobArgs.Cfg.SvcUser
+            $svcSecurePwd   = Get-Secret -Name BackupOpCredential -Vault ADAuditVault -AsPlainText:$false
+            $svcPlainPwd    = [System.Net.NetworkCredential]::new('', $svcSecurePwd).Password
 
-        $svcPlainPwd  = $null
-        $svcSecurePwd = $null
-        [GC]::Collect()
+            Register-ScheduledTask -TaskName 'ADPasswordAudit-Orchestrator' `
+                -Action $orchAction -RunLevel Highest `
+                -User $svcUserForTask -Password $svcPlainPwd -Force | Out-Null
+
+            $taskXml  = [xml](Export-ScheduledTask -TaskName 'ADPasswordAudit-Orchestrator')
+            $newTrig  = [xml]$orchTrigger
+            $importNs = $taskXml.Task.OwnerDocument.ImportNode($newTrig.Task.Triggers, $true)
+            $oldTrig  = $taskXml.Task.SelectSingleNode("*[local-name()='Triggers']")
+            if ($oldTrig) { $taskXml.Task.RemoveChild($oldTrig) | Out-Null }
+            $taskXml.Task.PrependChild($importNs) | Out-Null
+
+            Register-ScheduledTask -Xml $taskXml.OuterXml `
+                -TaskName 'ADPasswordAudit-Orchestrator' `
+                -User $svcUserForTask -Password $svcPlainPwd -Force | Out-Null
+            Log "  + ADPasswordAudit-Orchestrator (monthly, runs as $svcUserForTask)"
+
+            $retTrigger = New-ScheduledTaskTrigger -Daily -At '03:30am'
+            Register-ScheduledTask -TaskName 'ADPasswordAudit-Retention' `
+                -Action $retentAction -Trigger $retTrigger -RunLevel Highest `
+                -User $svcUserForTask -Password $svcPlainPwd -Force | Out-Null
+            Log "  + ADPasswordAudit-Retention (daily 03:30, runs as $svcUserForTask)"
+
+            $svcPlainPwd  = $null
+            $svcSecurePwd = $null
+            [GC]::Collect()
+        }
 
         # 10. DC bootstrap zip
         Step 96 'Build DC bootstrap zip: ADPasswordAudit-DC-bootstrap.zip...'
@@ -990,6 +1068,40 @@ $ctl.RbHibpDownload.Add_Checked({
     $ctl.HibpDownloadPanel.IsEnabled = $true
 })
 
+# gMSA / regular service account toggles
+$ctl.RbGmsa.Add_Checked({
+    $ctl.GmsaPanel.IsEnabled    = $true
+    $ctl.SvcUserPanel.IsEnabled = $false
+})
+$ctl.RbSvcUser.Add_Checked({
+    $ctl.GmsaPanel.IsEnabled    = $false
+    $ctl.SvcUserPanel.IsEnabled = $true
+})
+
+$ctl.BtnTestGmsa.Add_Click({
+    $name = $ctl.TbGmsaName.Text.Trim()
+    if (-not $name) {
+        $ctl.CredTestResult.Text = 'Enter the gMSA name first.'
+        $ctl.CredTestResult.Foreground = '#F38BA8'
+        return
+    }
+    $shortName = ($name -split '\\')[-1].TrimEnd('$')
+    try {
+        Import-Module ActiveDirectory -ErrorAction Stop
+        $ok = Test-ADServiceAccount -Identity $shortName
+        if ($ok) {
+            $ctl.CredTestResult.Text = ("OK - this host can retrieve the managed password for {0}." -f $shortName)
+            $ctl.CredTestResult.Foreground = 'LightGreen'
+        } else {
+            $ctl.CredTestResult.Text = ("FAIL - Test-ADServiceAccount returned False. Check that this host is in PrincipalsAllowedToRetrieveManagedPassword and that Install-ADServiceAccount {0} was run locally." -f $shortName)
+            $ctl.CredTestResult.Foreground = '#F38BA8'
+        }
+    } catch {
+        $ctl.CredTestResult.Text = "FAIL - $($_.Exception.Message). RSAT-AD-PowerShell might be missing - it will be installed during Install."
+        $ctl.CredTestResult.Foreground = '#F38BA8'
+    }
+})
+
 foreach ($btnName in 'BtnBrowseWork','BtnBrowseLog','BtnBrowseReport','BtnBrowseAttest','BtnBrowseHibp','BtnBrowseHibpDl') {
     $btn = $ctl[$btnName]
     if (-not $btn) { continue }
@@ -1069,11 +1181,15 @@ $ctl.BtnVerifyCred.Add_Click({
 })
 
 $ctl.BtnInstall.Add_Click({
-    if (-not $ctl.PbSvcPass.Password) {
-        [System.Windows.MessageBox]::Show('Go back to step 3 and enter the service account password.','Need password') | Out-Null
+    $cfg = Get-WizardModel
+    if (-not $cfg.UseGmsa -and -not $ctl.PbSvcPass.Password) {
+        [System.Windows.MessageBox]::Show('Go back to step 3 and enter the service account password (or switch to gMSA mode).','Need password') | Out-Null
         return
     }
-    $cfg = Get-WizardModel
+    if ($cfg.UseGmsa -and (-not $cfg.GmsaName -or -not $cfg.GmsaName.EndsWith('$'))) {
+        [System.Windows.MessageBox]::Show('Enter the gMSA name with a trailing $, e.g. CORP\gmsa-adaudit$','Bad gMSA') | Out-Null
+        return
+    }
     $jobArgs = @{
         Cfg              = $cfg
         SvcPasswordPlain = $ctl.PbSvcPass.Password
